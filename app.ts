@@ -28,6 +28,73 @@ let MAX_DATE: Date | undefined = undefined;
 if (process.env.MAX_DATE != null && process.env.MAX_DATE.length > 0)
     MAX_DATE = new Date(process.env.MAX_DATE as string);
 
+function getRecord(repo, collection, rkey) {
+    return new Promise((resolve, reject) => {
+        let options = {
+            method: 'GET',
+            hostname: 'public.api.bsky.app',
+            path: `/xrpc/com.atproto.repo.getRecord?repo=${repo}&collection=${collection}&rkey=${rkey}`,
+            headers: {
+                Accept: 'application/json'
+            },
+            maxRedirects: 20
+        };
+  
+      const req = https.request(options, (res) => {
+        let chunks = [] as any[];
+  
+        res.on('data', (chunk) => {
+            chunks.push(chunk);
+        });
+  
+        res.on('end', () => {
+            let body = Buffer.concat(chunks);
+            resolve(JSON.parse(body.toString()));
+        });
+  
+        res.on('error', (error) => {
+            reject(error);
+        });
+      });
+  
+      req.end();
+    });
+}
+  
+async function getReplyRefs(parentUri) {
+    try {
+        // Parse the parent URI
+        const [, , repo, collection, rkey] = parentUri.split('/');
+
+        // Fetch the parent record
+        const parent = await getRecord(repo, collection, rkey) as any;
+
+        let root;
+        if (parent.value.reply) {
+            const rootUri = parent.value.reply.root.uri;
+            const [, , rootRepo, rootCollection, rootRkey] = rootUri.split('/');
+            root = await getRecord(rootRepo, rootCollection, rootRkey);
+        } else {
+            // The parent record is a top-level post, so it is also the root
+            root = parent;
+        }
+
+        return {
+            root: {
+                uri: root.uri,
+                cid: root.cid,
+            },
+            parent: {
+                uri: parent.uri,
+                cid: parent.cid,
+            },
+        };
+    } catch (error) {
+        console.error('Error fetching reply refs:', error);
+        throw error;
+    }
+}
+
 async function resolveShorURL(url: string): Promise<string> {
     return new Promise<string>((resolve, reject) => {
         https.get(url, response => {
@@ -80,6 +147,7 @@ async function main() {
 
     const tweets = JSON.parse(fTweets.toString().replace("window.YTD.tweets.part0 = [", "["));
     let importedTweet = 0;
+    let importedTweetMap = [] as Record<string, string>[];
     if (tweets != null && tweets.length > 0) {
         const sortedTweets = tweets.sort((a, b) => {
             let ad = new Date(a.tweet.created_at).getTime();
@@ -107,9 +175,35 @@ async function main() {
             console.log(` Created at ${tweet_createdAt}`);
             console.log(` Full text '${tweet.full_text}'`);
 
+            let postText = tweet.full_text as string;
+
+            let reply = null as any;
+
             if (tweet.in_reply_to_screen_name) {
-                console.log("Discarded (reply)");
-                continue;
+                if (PAST_HANDLES?.includes(tweet.in_reply_to_screen_name)) {
+                    // Find parent and root uris to create reply refs
+                    // If the parent tweet is not found or root uri request not successful, skip this tweet
+                    console.log("Reply to own tweet");
+                    if (!SIMULATE) {
+                        const parentTweetId = tweet.in_reply_to_status_id_str;
+                        const parentBlueskyUri = importedTweetMap.find((x) => x.tweetId === parentTweetId)?.blueskyPostUri;
+                        if (parentBlueskyUri) {
+                            try {
+                                await new Promise(resolve => setTimeout(resolve, API_DELAY));
+                                reply = await getReplyRefs(parentBlueskyUri);
+                            } catch (error) {
+                                console.error('Error fetching reply refs:', error);
+                                continue;
+                            }
+                        } else {
+                            console.log("Parent not found, skipping tweet");
+                            continue;
+                        }
+                    }
+                } else {
+                    console.log("Discarded (reply to other user)");
+                    continue;
+                }
             }
             if (tweet.full_text.startsWith("@")) {
                 console.log("Discarded (start with @)");
@@ -149,6 +243,9 @@ async function main() {
                         const mediaFilename = `${process.env.ARCHIVE_FOLDER}/data/tweets_media/${tweet.id}-${media?.media_url.substring(i + 1)}`;
                         const imageBuffer = FS.readFileSync(mediaFilename);
 
+                        // remove media url from post text
+                        postText.replace(media?.url, "");
+
                         if (!SIMULATE) {
                             const blobRecord = await agent.uploadBlob(imageBuffer, {
                                 encoding: mimeType
@@ -178,12 +275,11 @@ async function main() {
                 continue;
             }
 
-            let postText = tweet.full_text as string;
             if (!SIMULATE) {
                 postText = await cleanTweetText(tweet.full_text);
 
-                if(postText.length > 300)
-                    postText = tweet.full_text;
+                // if(postText.length > 300)
+                //     postText = tweet.full_text;
 
                 if( postText.length > 300)
                     postText = postText.substring(0,296) + '...';
@@ -202,6 +298,9 @@ async function main() {
                 facets: rt.facets,
                 createdAt: tweet_createdAt,
                 embed: embeddedImage.length > 0 ? { $type: "app.bsky.embed.images", images: embeddedImage } : undefined,
+            } as any;
+            if (reply) {
+                postRecord.reply = reply
             }
 
             if (!SIMULATE) {
@@ -211,11 +310,12 @@ async function main() {
                 const recordData = await agent.post(postRecord);
                 const i = recordData.uri.lastIndexOf("/");
                 if (i > 0) {
-                    const rkey = recordData.uri.substring(i + 1);
-                    const postUri = `https://bsky.app/profile/${process.env.BLUESKY_USERNAME!}/post/${rkey}`;
-                    console.log("Bluesky post create, URL: " + postUri);
-
+                    // const rkey = recordData.uri.substring(i + 1);
+                    // const postUri = `https://bsky.app/profile/${process.env.BLUESKY_USERNAME!}/post/${rkey}`;
+                    // console.log("Bluesky post create, URL: " + postUri);
                     importedTweet++;
+                    importedTweetMap.push({ tweetId: tweet.id, blueskyPostUri: recordData.uri });
+                    console.log(`blueskyPostUri: '${recordData.uri}'`);
                 } else {
                     console.warn(recordData);
                 }
