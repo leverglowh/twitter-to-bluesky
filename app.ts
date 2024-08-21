@@ -166,7 +166,7 @@ async function main() {
                         }
                     }
 
-                    if (media?.type === "video") {
+                    if (media?.type === "video" || media?.type === "animated_gif") {
                         tweetWithEmbeddedVideo = true;
                         continue;
                     }
